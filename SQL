@@ -1,0 +1,328 @@
+WITH SelectedRoles AS (
+    -- Selecting roles where SELECTED = 1 (i.e., roles that were actively selected)
+    SELECT 
+        war.ROLE_NAME,
+        wra.ACCOUNT,
+        wra.SELECTED,
+        CAST(wra.TIME AS DATE) AS [DATE], -- Extracting date part of TIME
+        CAST(wra.TIME AS TIME) AS [TIME]  -- Extracting time part of TIME
+    FROM [TMDailyLog].[dbo].[WA_ROLE_ACTIVITY] AS wra
+    LEFT JOIN [TMDataMart].[dbo].[WORK_ASSIGNMENT_ROLE] AS war
+    ON wra.ROLE_ID = war.ROLE_ID
+     WHERE TIME >= '01-01-2024 00:00:00'
+        AND TIME <= FORMAT(GETDATE() - 1, 'MM/dd/yyyy 00:00:00')
+        AND wra.SELECTED = 1           -- Only selected roles
+        AND (ROLE_NAME LIKE '**%' OR ROLE_NAME IN ('MT - Resource_All', 'MT - State Fair', '1 Stand By'))
+),
+
+UnselectedRoles AS (
+    -- Selecting roles where SELECTED = 0 (i.e., roles that were not selected) and excluding 'All Roles'
+    SELECT 
+        war.ROLE_NAME,
+        wra.ACCOUNT,
+        wra.SELECTED,
+        CAST(wra.TIME AS DATE) AS [DATE], -- Extracting date part of TIME
+        CAST(wra.TIME AS TIME) AS [TIME]  -- Extracting time part of TIME
+    FROM [TMDailyLog].[dbo].[WA_ROLE_ACTIVITY] AS wra
+    LEFT JOIN [TMDataMart].[dbo].[WORK_ASSIGNMENT_ROLE] AS war
+    ON wra.ROLE_ID = war.ROLE_ID
+     WHERE TIME >= '01-01-2024 00:00:00'
+        AND TIME <= FORMAT(GETDATE() - 1, 'MM/dd/yyyy 00:00:00')
+        AND wra.SELECTED = 0           -- Only unselected roles
+        AND ROLE_NAME NOT LIKE 'All Roles'
+),
+
+AllRoles AS (
+    -- Selecting roles where SELECTED = 0 and ROLE_NAME = 'All Roles'
+    SELECT 
+        war.ROLE_NAME,
+        wra.ACCOUNT,
+        wra.SELECTED,
+        CAST(wra.TIME AS DATE) AS [DATE], -- Extracting date part of TIME
+        CAST(wra.TIME AS TIME) AS [TIME]  -- Extracting time part of TIME
+    FROM [TMDailyLog].[dbo].[WA_ROLE_ACTIVITY] AS wra
+    LEFT JOIN [TMDataMart].[dbo].[WORK_ASSIGNMENT_ROLE] AS war
+    ON wra.ROLE_ID = war.ROLE_ID
+     WHERE TIME >= '01-01-2024 00:00:00'
+        AND TIME <= FORMAT(GETDATE() - 1, 'MM/dd/yyyy 00:00:00')
+        AND wra.SELECTED = 0           -- Only unselected roles
+        AND ROLE_NAME LIKE 'All Roles'
+),
+
+MatchedRoles AS (
+    -- Matching selected and unselected roles based on time proximity
+    SELECT 
+        sr.ACCOUNT, 
+        sr.[DATE], 
+        sr.ROLE_NAME, 
+        sr.[TIME] AS [in], 
+        ur.[TIME] AS [out],
+        ROW_NUMBER() OVER (PARTITION BY sr.ACCOUNT, sr.[DATE], sr.[TIME], sr.ROLE_NAME ORDER BY DATEDIFF(SECOND, sr.[TIME], ur.[TIME])) AS rn
+    FROM SelectedRoles sr
+    JOIN UnselectedRoles ur ON sr.ACCOUNT = ur.ACCOUNT AND sr.[DATE] = ur.[DATE] AND sr.ROLE_NAME = ur.ROLE_NAME
+    WHERE DATEDIFF(SECOND, sr.[TIME], ur.[TIME]) >= 0 -- Ensure end time is after start time
+),
+
+UnmatchedRoles AS (
+    -- Identifying unmatched selected roles against 'All Roles'
+    SELECT 
+        sr.ROLE_NAME,
+        sr.ACCOUNT,
+        sr.[DATE],
+        sr.[TIME] AS [in],
+        ar.[TIME] AS [out],
+        ROW_NUMBER() OVER (PARTITION BY sr.ACCOUNT, sr.[DATE], sr.[TIME], sr.ROLE_NAME ORDER BY DATEDIFF(SECOND, sr.[TIME], ar.[TIME])) AS rn
+    FROM SelectedRoles sr
+    LEFT JOIN MatchedRoles mr ON sr.ACCOUNT = mr.ACCOUNT AND sr.[DATE] = mr.[DATE] AND sr.[TIME] = mr.[in] AND sr.ROLE_NAME = mr.ROLE_NAME
+    JOIN AllRoles ar ON sr.ACCOUNT = ar.ACCOUNT AND sr.[DATE] = ar.[DATE]
+    WHERE mr.ACCOUNT IS NULL -- Select rows that were not matched
+      AND DATEDIFF(SECOND, sr.[TIME], ar.[TIME]) >= 0
+),
+
+SignedInTable AS (
+    -- Combining matched and unmatched roles
+    SELECT 
+        ACCOUNT, 
+        [DATE], 
+        ROLE_NAME, 
+        MatchedRoles.[in] AS Signed_In, 
+        MatchedRoles.[out] AS Signed_Out
+    FROM MatchedRoles
+    WHERE rn = 1 -- Select the first row for each match
+    UNION ALL
+    SELECT 
+        ACCOUNT, 
+        [DATE], 
+        ROLE_NAME, 
+        UnmatchedRoles.[in], 
+        UnmatchedRoles.[out]
+    FROM UnmatchedRoles
+    WHERE rn = 1 -- Select the first row for each unmatched role
+),
+
+ShiftTable AS (
+    -- Calculating minimum 'in' time and maximum 'out' time for each account and date
+    SELECT 
+        ACCOUNT, 
+        [DATE],
+        MIN(Signed_In) AS Shift_Start,
+        MAX(Signed_Out) AS Shift_End
+    FROM SignedInTable
+    GROUP BY ACCOUNT, [DATE]
+) 
+---not in 2,3,4,5,6 ------------
+,
+alldata AS (
+    -- Filtering for specific ROLE_NAME patterns
+    SELECT *, 'signed in' AS type
+    FROM SignedInTable
+    WHERE ROLE_NAME LIKE '**%'
+),
+RoleGaps1 AS (
+    -- Finding gaps between signed-in times for each role
+    SELECT 
+        ACCOUNT, 
+        DATE, 
+        ROLE_NAME, 
+        LEAD(Signed_In) OVER (PARTITION BY ACCOUNT, DATE ORDER BY Signed_In) AS Next_Signed_In, 
+        Signed_Out
+    FROM 
+        alldata
+),
+
+RoleGaps AS (
+    -- Combining gaps from RoleGaps1 with gaps from all selected roles
+    SELECT 
+        ACCOUNT, 
+        DATE, 
+        ROLE_NAME, 
+        LEAD(Signed_In) OVER (PARTITION BY ACCOUNT, DATE, ROLE_NAME ORDER BY Signed_In) AS Next_Signed_In, 
+        Signed_Out
+    FROM 
+        alldata
+    UNION
+    SELECT 
+        ACCOUNT, 
+        DATE, 
+        ROLE_NAME, 
+        Next_Signed_In, 
+        Signed_Out
+    FROM 
+        RoleGaps1
+),
+RoleGapsWithGaps AS (
+    -- Identifying periods where there is a gap between signed-out and next signed-in times
+    SELECT 
+        ACCOUNT, 
+        DATE, 
+        ROLE_NAME, 
+        Signed_Out AS Gap_Start, 
+        Next_Signed_In AS Gap_End
+    FROM 
+        RoleGaps
+    WHERE 
+        Next_Signed_In IS NOT NULL
+        AND Next_Signed_In > Signed_Out
+),
+OverlapTimes AS (
+    -- Finding overlapping times between different roles
+    SELECT 
+        a.ACCOUNT, 
+        a.DATE, 
+        a.ROLE_NAME, 
+        b.Signed_In, 
+        b.Signed_Out
+    FROM 
+        RoleGapsWithGaps a
+    JOIN 
+        alldata b
+    ON 
+        a.ACCOUNT = b.ACCOUNT 
+        AND a.DATE = b.DATE 
+        AND a.ROLE_NAME != b.ROLE_NAME
+    WHERE 
+        a.Gap_Start < b.Signed_Out 
+        AND a.Gap_End > b.Signed_In
+),
+FinalGaps AS (
+    -- Adjusting gaps considering overlaps with other roles
+    SELECT 
+        g.ACCOUNT, 
+        g.DATE, 
+        g.ROLE_NAME, 
+        CASE 
+            WHEN g.Gap_Start < o.Signed_In THEN o.Signed_In ELSE g.Gap_Start 
+        END AS Gap_Start, 
+        CASE 
+            WHEN g.Gap_End > o.Signed_Out THEN o.Signed_Out ELSE g.Gap_End 
+        END AS Gap_End
+    FROM 
+        RoleGapsWithGaps g
+    LEFT JOIN 
+        OverlapTimes o
+    ON 
+        g.ACCOUNT = o.ACCOUNT 
+        AND g.DATE = o.DATE 
+        AND g.ROLE_NAME = o.ROLE_NAME 
+        AND g.Gap_Start < o.Signed_Out 
+        AND g.Gap_End > o.Signed_In
+    WHERE 
+        o.Signed_In IS NULL 
+        OR o.Signed_Out IS NULL
+),
+OverallGaps AS (
+    -- Summarizing overall gaps for each role
+    SELECT 
+        ACCOUNT, 
+        DATE, 
+        ROLE_NAME, 
+        MIN(Gap_Start) AS Overall_Gap_Start, 
+        MAX(Gap_End) AS Overall_Gap_End
+    FROM 
+        FinalGaps
+    GROUP BY 
+        ACCOUNT, DATE, ROLE_NAME
+),
+notindata AS (
+    -- Placeholder for gaps not in the usual roles (2,3,4,5,6)
+    SELECT 
+        ACCOUNT, 
+        DATE, 
+        'not in 2,3,4,5,6' AS ROLE_NAME, 
+        Overall_Gap_Start, 
+        Overall_Gap_End
+    FROM 
+        OverallGaps
+),
+---not in 2,3,4,5,6 ------------
+
+Gaps AS (
+    -- Calculating gaps before, between, and after signed-in times
+    SELECT
+        ShiftTable.ACCOUNT,
+        ShiftTable.DATE,
+        ROLE_NAME,
+        ShiftTable.Shift_Start AS Signed_In,
+        MIN(SignedInTable.Signed_In) AS Signed_Out
+    FROM
+        ShiftTable
+        LEFT JOIN SignedInTable ON ShiftTable.ACCOUNT = SignedInTable.ACCOUNT
+        AND ShiftTable.DATE = SignedInTable.DATE
+    GROUP BY
+        ShiftTable.ACCOUNT,
+        ShiftTable.DATE,
+        ROLE_NAME,
+        ShiftTable.Shift_Start
+    
+    UNION ALL
+    
+    -- Gaps between consecutive signed-in times
+    SELECT
+        SignedInTable.ACCOUNT,
+        SignedInTable.DATE,
+        SignedInTable.ROLE_NAME,
+        SignedInTable.Signed_Out AS Signed_In,
+        LEAD(SignedInTable.Signed_In) OVER (PARTITION BY SignedInTable.ACCOUNT, SignedInTable.DATE, SignedInTable.ROLE_NAME  ORDER BY SignedInTable.Signed_In) AS Signed_Out
+    FROM
+        SignedInTable
+
+    UNION ALL
+    
+    -- Period after the last signed-in time
+    SELECT
+        ShiftTable.ACCOUNT,
+        ShiftTable.DATE,
+        ROLE_NAME,
+        MAX(SignedInTable.Signed_Out) AS Signed_In,
+        ShiftTable.Shift_End AS Signed_Out
+    FROM
+        ShiftTable
+        LEFT JOIN SignedInTable ON ShiftTable.ACCOUNT = SignedInTable.ACCOUNT
+        AND ShiftTable.DATE = SignedInTable.DATE
+    GROUP BY
+        ShiftTable.ACCOUNT,
+        ShiftTable.DATE,
+        ROLE_NAME,
+        ShiftTable.Shift_End
+    
+    UNION ALL
+
+    -- Gaps not covered in roles 2,3,4,5,6
+    SELECT
+        ACCOUNT, 
+        DATE, 
+        'Not in 2,3,4,5,6' AS ROLE_NAME, 
+        Overall_Gap_Start, 
+        Overall_Gap_End
+    FROM
+        notindata
+)
+-- Selecting the final result with role type
+SELECT
+    ACCOUNT,
+    DATE,
+    ROLE_NAME,
+    Signed_In,
+    Signed_Out,
+    'Signed Out' AS Type,
+	ACCOUNT + '' + ROLE_NAME as AccRol
+FROM
+    Gaps
+WHERE
+    Signed_In < Signed_Out
+    AND Signed_In IS NOT NULL
+    AND Signed_Out IS NOT NULL
+
+UNION ALL
+
+-- Adding records for signed-in periods
+SELECT
+    ACCOUNT,
+    DATE,
+    ROLE_NAME,
+    Signed_In,
+    Signed_Out,
+    'Signed In' AS Type,
+	ACCOUNT + '' + ROLE_NAME
+FROM SignedInTable
+ORDER BY ACCOUNT, DATE, ROLE_NAME, Signed_In
